@@ -1,0 +1,8 @@
+build/
+cmake-build-*/
+.vs/
+.vscode/
+*.lib
+*.pdb
+*.exp
+*.ilk

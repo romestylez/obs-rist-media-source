@@ -91,6 +91,12 @@ struct frame_probe {
 	struct rist_media_source *owner;
 };
 
+struct audio_relay_task {
+	obs_source_t *target;
+	struct obs_source_audio audio;
+	uint8_t storage[];
+};
+
 static void mutex_init(rist_mutex_t *mutex)
 {
 #ifdef _WIN32
@@ -216,25 +222,62 @@ static struct obs_source_frame *probe_video(void *data, struct obs_source_frame 
 	return frame;
 }
 
+static void output_relayed_audio(void *data)
+{
+	struct audio_relay_task *task = data;
+	obs_source_output_audio(task->target, &task->audio);
+	obs_source_release(task->target);
+	bfree(task);
+}
+
 static struct obs_audio_data *probe_audio(void *data, struct obs_audio_data *audio)
 {
 	struct frame_probe *probe = data;
-	if (!audio || !probe || !probe->owner)
+	if (!audio || !probe || !probe->owner || !audio->frames)
+		return audio;
+	if (atomic_load_explicit(&probe->owner->stopping, memory_order_acquire))
 		return audio;
 
 	struct obs_audio_info audio_info;
 	if (!obs_get_audio_info(&audio_info))
 		return audio;
 
-	struct obs_source_audio output = {0};
-	for (size_t plane = 0; plane < MAX_AV_PLANES; ++plane)
-		output.data[plane] = audio->data[plane];
-	output.frames = audio->frames;
-	output.speakers = audio_info.speakers;
-	output.format = AUDIO_FORMAT_FLOAT_PLANAR;
-	output.samples_per_sec = audio_info.samples_per_sec;
-	output.timestamp = audio->timestamp;
-	obs_source_output_audio(probe->owner->source, &output);
+	const size_t channels = get_audio_channels(audio_info.speakers);
+	const size_t plane_size = (size_t)audio->frames * sizeof(float);
+	if (!channels || plane_size > (SIZE_MAX - sizeof(struct audio_relay_task)) / channels)
+		return audio;
+
+	obs_source_t *target = obs_source_get_ref(probe->owner->source);
+	if (!target)
+		return audio;
+
+	struct audio_relay_task *task = bzalloc(sizeof(*task) + plane_size * channels);
+	if (!task) {
+		obs_source_release(target);
+		return audio;
+	}
+
+	task->target = target;
+	task->audio.frames = audio->frames;
+	task->audio.speakers = audio_info.speakers;
+	task->audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	task->audio.samples_per_sec = audio_info.samples_per_sec;
+	task->audio.timestamp = audio->timestamp;
+
+	for (size_t channel = 0; channel < channels; ++channel) {
+		if (!audio->data[channel]) {
+			obs_source_release(target);
+			bfree(task);
+			return audio;
+		}
+		uint8_t *plane = task->storage + channel * plane_size;
+		memcpy(plane, audio->data[channel], plane_size);
+		task->audio.data[channel] = plane;
+	}
+
+	/* The filter callback runs under the child source's filter lock.  Queueing
+	 * the parent output breaks the parent/child lock inversion seen in hangs. */
+	obs_queue_task(OBS_TASK_AUDIO, output_relayed_audio, task, false);
 	return audio;
 }
 

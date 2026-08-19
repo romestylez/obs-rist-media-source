@@ -9,6 +9,7 @@
 #include <librist/librist.h>
 #include <librist/librist_srp.h>
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -59,12 +60,16 @@ typedef pthread_mutex_t rist_mutex_t;
 #define MAX_RECOVERY_MS 30000
 #define MAX_TIMEOUT_MS 60000
 #define RECEIVER_POLL_MS 50
+#define MIN_PIPELINE_RESET_GAP_MS 500
 #define NSEC_PER_MSEC UINT64_C(1000000)
 
 struct rist_media_source {
 	obs_source_t *source;
+	/* media_source receives the current generation. display_source can keep
+	 * the previous generation alive until the replacement has a video frame. */
 	obs_source_t *media_source;
 	obs_source_t *frame_probe;
+	obs_source_t *display_source;
 	rist_mutex_t child_mutex;
 	rist_thread_t receiver_thread;
 	bool thread_started;
@@ -72,6 +77,8 @@ struct rist_media_source {
 	atomic_bool received_video;
 	atomic_uint_fast64_t last_video_at_ns;
 	atomic_uint_fast64_t stale_ns;
+	atomic_uint_fast64_t media_generation;
+	atomic_uint_fast64_t ready_video_generation;
 
 	char *url;
 	char *username;
@@ -89,12 +96,7 @@ struct rist_media_source {
 
 struct frame_probe {
 	struct rist_media_source *owner;
-};
-
-struct audio_relay_task {
-	obs_source_t *target;
-	struct obs_source_audio audio;
-	uint8_t storage[];
+	uint64_t generation;
 };
 
 static void mutex_init(rist_mutex_t *mutex)
@@ -215,98 +217,42 @@ static void probe_destroy(void *data)
 static struct obs_source_frame *probe_video(void *data, struct obs_source_frame *frame)
 {
 	struct frame_probe *probe = data;
-	if (frame && probe->owner) {
+	if (frame && probe->owner &&
+	    probe->generation == atomic_load_explicit(&probe->owner->media_generation, memory_order_acquire)) {
 		atomic_store_explicit(&probe->owner->last_video_at_ns, os_gettime_ns(), memory_order_release);
 		atomic_store_explicit(&probe->owner->received_video, true, memory_order_release);
+		atomic_store_explicit(&probe->owner->ready_video_generation, probe->generation, memory_order_release);
 	}
 	return frame;
-}
-
-static void output_relayed_audio(void *data)
-{
-	struct audio_relay_task *task = data;
-	obs_source_output_audio(task->target, &task->audio);
-	obs_source_release(task->target);
-	bfree(task);
-}
-
-static struct obs_audio_data *probe_audio(void *data, struct obs_audio_data *audio)
-{
-	struct frame_probe *probe = data;
-	if (!audio || !probe || !probe->owner || !audio->frames)
-		return audio;
-	if (atomic_load_explicit(&probe->owner->stopping, memory_order_acquire))
-		return audio;
-
-	struct obs_audio_info audio_info;
-	if (!obs_get_audio_info(&audio_info))
-		return audio;
-
-	const size_t channels = get_audio_channels(audio_info.speakers);
-	const size_t plane_size = (size_t)audio->frames * sizeof(float);
-	if (!channels || plane_size > (SIZE_MAX - sizeof(struct audio_relay_task)) / channels)
-		return audio;
-
-	obs_source_t *target = obs_source_get_ref(probe->owner->source);
-	if (!target)
-		return audio;
-
-	struct audio_relay_task *task = bzalloc(sizeof(*task) + plane_size * channels);
-	if (!task) {
-		obs_source_release(target);
-		return audio;
-	}
-
-	task->target = target;
-	task->audio.frames = audio->frames;
-	task->audio.speakers = audio_info.speakers;
-	task->audio.format = AUDIO_FORMAT_FLOAT_PLANAR;
-	task->audio.samples_per_sec = audio_info.samples_per_sec;
-	task->audio.timestamp = audio->timestamp;
-
-	for (size_t channel = 0; channel < channels; ++channel) {
-		if (!audio->data[channel]) {
-			obs_source_release(target);
-			bfree(task);
-			return audio;
-		}
-		uint8_t *plane = task->storage + channel * plane_size;
-		memcpy(plane, audio->data[channel], plane_size);
-		task->audio.data[channel] = plane;
-	}
-
-	/* The filter callback runs under the child source's filter lock.  Queueing
-	 * the parent output breaks the parent/child lock inversion seen in hangs. */
-	obs_queue_task(OBS_TASK_AUDIO, output_relayed_audio, task, false);
-	return audio;
 }
 
 static struct obs_source_info frame_probe_info = {
 	.id = "rist_media_source_frame_probe",
 	.type = OBS_SOURCE_TYPE_FILTER,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_ASYNC | OBS_SOURCE_CAP_DISABLED,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_ASYNC | OBS_SOURCE_CAP_DISABLED,
 	.get_name = probe_name,
 	.create = probe_create,
 	.destroy = probe_destroy,
 	.filter_video = probe_video,
-	.filter_audio = probe_audio,
 };
 
-static obs_source_t *create_media_child(struct rist_media_source *source)
+static obs_source_t *create_media_child(struct rist_media_source *source, uint16_t udp_port)
 {
 	struct dstr input = {0};
-	dstr_printf(&input, "udp://127.0.0.1:%u?fifo_size=1000000&overrun_nonfatal=1", source->udp_port);
+	dstr_printf(&input, "udp://127.0.0.1:%u?fifo_size=1000000&overrun_nonfatal=1", udp_port);
 
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_bool(settings, "is_local_file", false);
 	obs_data_set_string(settings, "input", input.array);
 	obs_data_set_string(settings, "input_format", "mpegts");
 	obs_data_set_bool(settings, "hw_decode", source->hw_decode);
-	obs_data_set_bool(settings, "clear_on_media_end", true);
+	obs_data_set_bool(settings, "clear_on_media_end", false);
 	obs_data_set_bool(settings, "restart_on_activate", false);
 	obs_data_set_bool(settings, "close_when_inactive", false);
 	obs_data_set_bool(settings, "log_changes", false);
-	obs_data_set_int(settings, "buffering_mb", 0);
+	/* Match the OBS Media Source decoder buffer. libRIST recovery remains a
+	 * separate, user-configurable buffer in front of this source. */
+	obs_data_set_int(settings, "buffering_mb", 2);
 	obs_data_set_int(settings, "reconnect_delay_sec", 1);
 
 	obs_source_t *child = obs_source_create_private("ffmpeg_source", NULL, settings);
@@ -315,13 +261,104 @@ static obs_source_t *create_media_child(struct rist_media_source *source)
 	return child;
 }
 
-static obs_source_t *create_frame_probe(struct rist_media_source *source)
+static obs_source_t *create_frame_probe(struct rist_media_source *source, uint64_t generation)
 {
 	obs_data_t *settings = obs_data_create();
 	obs_data_set_int(settings, PROBE_OWNER, (int64_t)(uintptr_t)source);
 	obs_source_t *probe = obs_source_create_private(frame_probe_info.id, NULL, settings);
 	obs_data_release(settings);
+	if (probe) {
+		struct frame_probe *probe_data = obs_obj_get_data(probe);
+		if (probe_data)
+			probe_data->generation = generation;
+	}
 	return probe;
+}
+
+static void detach_pipeline(obs_source_t *parent, obs_source_t *child, obs_source_t *probe)
+{
+	if (child && probe)
+		obs_source_filter_remove(child, probe);
+	if (child)
+		obs_source_remove_active_child(parent, child);
+	if (probe)
+		obs_source_release(probe);
+	if (child)
+		obs_source_release(child);
+}
+
+static bool replace_media_pipeline(struct rist_media_source *source, uint16_t *port_out)
+{
+	const uint16_t udp_port = choose_udp_port();
+	if (!udp_port) {
+		blog(LOG_ERROR, "[RIST Media Source] could not choose a loopback UDP port");
+		return false;
+	}
+
+	const uint64_t generation =
+		atomic_fetch_add_explicit(&source->media_generation, 1, memory_order_acq_rel) + 1;
+	atomic_store_explicit(&source->ready_video_generation, 0, memory_order_release);
+	obs_source_t *child = create_media_child(source, udp_port);
+	obs_source_t *probe = child ? create_frame_probe(source, generation) : NULL;
+	if (!child || !probe) {
+		blog(LOG_ERROR, "[RIST Media Source] OBS FFmpeg media source is unavailable");
+		if (probe)
+			obs_source_release(probe);
+		if (child)
+			obs_source_release(child);
+		return false;
+	}
+
+	obs_source_filter_add(child, probe);
+	if (!obs_source_add_active_child(source->source, child)) {
+		blog(LOG_ERROR, "[RIST Media Source] could not activate the OBS FFmpeg media source");
+		obs_source_filter_remove(child, probe);
+		obs_source_release(probe);
+		obs_source_release(child);
+		return false;
+	}
+
+	mutex_lock(&source->child_mutex);
+	obs_source_t *old_child = source->media_source;
+	obs_source_t *old_probe = source->frame_probe;
+	source->media_source = child;
+	source->frame_probe = probe;
+	source->udp_port = udp_port;
+	if (!source->display_source)
+		source->display_source = obs_source_get_ref(child);
+	mutex_unlock(&source->child_mutex);
+
+	detach_pipeline(source->source, old_child, old_probe);
+	if (port_out)
+		*port_out = udp_port;
+	blog(LOG_INFO, "[RIST Media Source] opened media pipeline generation %llu on UDP port %u",
+	     (unsigned long long)generation, udp_port);
+	return true;
+}
+
+struct pipeline_reset_task {
+	struct rist_media_source *source;
+	uint16_t udp_port;
+	bool succeeded;
+};
+
+static void reset_pipeline_task(void *data)
+{
+	struct pipeline_reset_task *task = data;
+	if (!atomic_load_explicit(&task->source->stopping, memory_order_acquire))
+		task->succeeded = replace_media_pipeline(task->source, &task->udp_port);
+}
+
+static bool reset_media_pipeline(struct rist_media_source *source, uint16_t *port_out)
+{
+	struct pipeline_reset_task task = {.source = source};
+	/* Child graph replacement and retirement belong on the graphics task
+	 * queue. Waiting installs the new pipeline before the first packet of the
+	 * resumed stream is forwarded. */
+	obs_queue_task(OBS_TASK_GRAPHICS, reset_pipeline_task, &task, true);
+	if (task.succeeded && port_out)
+		*port_out = task.udp_port;
+	return task.succeeded;
 }
 
 static int rist_log_callback(void *arg, enum rist_log_level level, const char *message)
@@ -332,6 +369,26 @@ static int rist_log_callback(void *arg, enum rist_log_level level, const char *m
 	else if (level <= RIST_LOG_WARN)
 		blog(LOG_WARNING, "[RIST Media Source/libRIST] %s", message);
 	return 0;
+}
+
+static uint16_t get_udp_port(struct rist_media_source *source)
+{
+	mutex_lock(&source->child_mutex);
+	const uint16_t udp_port = source->udp_port;
+	mutex_unlock(&source->child_mutex);
+	return udp_port;
+}
+
+static uint64_t pipeline_reset_gap_ns(struct rist_media_source *source)
+{
+	uint64_t gap_ns = atomic_load_explicit(&source->stale_ns, memory_order_acquire);
+	if (!gap_ns) {
+		const uint32_t timeout_ms =
+			source->recovery_ms > source->reconnect_ms ? source->recovery_ms : source->reconnect_ms;
+		gap_ns = (uint64_t)timeout_ms * NSEC_PER_MSEC;
+	}
+	const uint64_t minimum_ns = (uint64_t)MIN_PIPELINE_RESET_GAP_MS * NSEC_PER_MSEC;
+	return gap_ns < minimum_ns ? minimum_ns : gap_ns;
 }
 
 static int run_receiver(struct rist_media_source *source)
@@ -399,19 +456,45 @@ static int run_receiver(struct rist_media_source *source)
 	struct sockaddr_in destination = {0};
 	destination.sin_family = AF_INET;
 	destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	destination.sin_port = htons(source->udp_port);
+	destination.sin_port = htons(get_udp_port(source));
+	uint64_t last_payload_at_ns = 0;
 
 	while (!atomic_load_explicit(&source->stopping, memory_order_acquire)) {
 		struct rist_data_block *block = NULL;
 		result = rist_receiver_data_read2(context, &block, RECEIVER_POLL_MS);
 		if (result > 0 && block && block->payload && block->payload_len > 0) {
+			const uint64_t now = os_gettime_ns();
+			if (last_payload_at_ns && now >= last_payload_at_ns &&
+			    now - last_payload_at_ns >= pipeline_reset_gap_ns(source)) {
+				const uint64_t gap_ms = (now - last_payload_at_ns) / NSEC_PER_MSEC;
+				uint16_t udp_port = 0;
+				blog(LOG_INFO,
+				     "[RIST Media Source] rebuilding media pipeline after %llu ms without payload",
+				     (unsigned long long)gap_ms);
+				if (!reset_media_pipeline(source, &udp_port)) {
+					result = -1;
+					rist_receiver_data_block_free2(&block);
+					break;
+				}
+				destination.sin_port = htons(udp_port);
+			}
+
 #ifdef _WIN32
-			sendto(udp_socket, (const char *)block->payload, (int)block->payload_len, 0,
-			       (const struct sockaddr *)&destination, sizeof(destination));
+			const int sent = sendto(udp_socket, (const char *)block->payload, (int)block->payload_len, 0,
+						(const struct sockaddr *)&destination, sizeof(destination));
+			const int socket_error = sent < 0 ? WSAGetLastError() : 0;
 #else
-			sendto(udp_socket, block->payload, block->payload_len, 0,
-			       (const struct sockaddr *)&destination, sizeof(destination));
+			const ssize_t sent = sendto(udp_socket, block->payload, block->payload_len, 0,
+						    (const struct sockaddr *)&destination, sizeof(destination));
+			const int socket_error = sent < 0 ? errno : 0;
 #endif
+			if (sent < 0 || (size_t)sent != block->payload_len) {
+				blog(LOG_WARNING, "[RIST Media Source] loopback UDP send failed (%d)", socket_error);
+				result = -1;
+				rist_receiver_data_block_free2(&block);
+				break;
+			}
+			last_payload_at_ns = now;
 		}
 		if (block)
 			rist_receiver_data_block_free2(&block);
@@ -460,7 +543,13 @@ static void *receiver_thread(void *data)
 		     source->reconnect_ms);
 		if (!wait_for_reconnect(source))
 			break;
+		while (!reset_media_pipeline(source, NULL)) {
+			blog(LOG_WARNING, "[RIST Media Source] media pipeline rebuild failed; retrying");
+			if (!wait_for_reconnect(source))
+				goto receiver_done;
+		}
 	}
+receiver_done:
 #ifdef _WIN32
 	return 0;
 #else
@@ -473,18 +562,18 @@ static void detach_child(struct rist_media_source *source)
 	mutex_lock(&source->child_mutex);
 	obs_source_t *child = source->media_source;
 	obs_source_t *probe = source->frame_probe;
+	obs_source_t *display = source->display_source;
 	source->media_source = NULL;
 	source->frame_probe = NULL;
+	source->display_source = NULL;
+	source->udp_port = 0;
 	mutex_unlock(&source->child_mutex);
 
-	if (child && probe)
-		obs_source_filter_remove(child, probe);
-	if (child)
-		obs_source_remove_active_child(source->source, child);
-	if (probe)
-		obs_source_release(probe);
-	if (child)
-		obs_source_release(child);
+	atomic_store_explicit(&source->media_generation, 0, memory_order_release);
+	atomic_store_explicit(&source->ready_video_generation, 0, memory_order_release);
+	detach_pipeline(source->source, child, probe);
+	if (display)
+		obs_source_release(display);
 }
 
 static void stop_source(struct rist_media_source *source)
@@ -515,33 +604,14 @@ static bool start_source(struct rist_media_source *source)
 		return false;
 	}
 
-	source->udp_port = choose_udp_port();
-	if (!source->udp_port) {
-		blog(LOG_ERROR, "[RIST Media Source] could not choose a loopback UDP port");
+	atomic_store_explicit(&source->stopping, false, memory_order_release);
+	if (!replace_media_pipeline(source, NULL)) {
+		atomic_store_explicit(&source->stopping, true, memory_order_release);
 		return false;
 	}
-
-	obs_source_t *child = create_media_child(source);
-	obs_source_t *probe = child ? create_frame_probe(source) : NULL;
-	if (!child || !probe) {
-		blog(LOG_ERROR, "[RIST Media Source] OBS FFmpeg media source is unavailable");
-		if (probe)
-			obs_source_release(probe);
-		if (child)
-			obs_source_release(child);
-		return false;
-	}
-
-	obs_source_filter_add(child, probe);
-	obs_source_add_active_child(source->source, child);
-	mutex_lock(&source->child_mutex);
-	source->media_source = child;
-	source->frame_probe = probe;
-	mutex_unlock(&source->child_mutex);
 
 	atomic_store_explicit(&source->received_video, false, memory_order_release);
 	atomic_store_explicit(&source->last_video_at_ns, os_gettime_ns(), memory_order_release);
-	atomic_store_explicit(&source->stopping, false, memory_order_release);
 #ifdef _WIN32
 	source->receiver_thread = CreateThread(NULL, 0, receiver_thread, source, 0, NULL);
 	const bool thread_created = source->receiver_thread != NULL;
@@ -557,12 +627,38 @@ static bool start_source(struct rist_media_source *source)
 	return true;
 }
 
-static obs_source_t *get_child(struct rist_media_source *source)
+static obs_source_t *get_media_child(struct rist_media_source *source)
 {
 	mutex_lock(&source->child_mutex);
 	obs_source_t *child = source->media_source ? obs_source_get_ref(source->media_source) : NULL;
 	mutex_unlock(&source->child_mutex);
 	return child;
+}
+
+static obs_source_t *get_display_child(struct rist_media_source *source)
+{
+	mutex_lock(&source->child_mutex);
+	obs_source_t *child = source->display_source ? obs_source_get_ref(source->display_source) : NULL;
+	mutex_unlock(&source->child_mutex);
+	return child;
+}
+
+static void promote_ready_video(struct rist_media_source *source)
+{
+	const uint64_t generation = atomic_load_explicit(&source->media_generation, memory_order_acquire);
+	if (!generation || atomic_load_explicit(&source->ready_video_generation, memory_order_acquire) != generation)
+		return;
+
+	mutex_lock(&source->child_mutex);
+	obs_source_t *old_display = NULL;
+	if (source->media_source && source->display_source != source->media_source &&
+	    generation == atomic_load_explicit(&source->media_generation, memory_order_relaxed)) {
+		old_display = source->display_source;
+		source->display_source = obs_source_get_ref(source->media_source);
+	}
+	mutex_unlock(&source->child_mutex);
+	if (old_display)
+		obs_source_release(old_display);
 }
 
 static const char *source_name(void *unused)
@@ -707,6 +803,8 @@ static void *source_create(obs_data_t *settings, obs_source_t *context)
 	atomic_init(&source->received_video, false);
 	atomic_init(&source->last_video_at_ns, 0);
 	atomic_init(&source->stale_ns, (uint64_t)DEFAULT_STALE_MS * NSEC_PER_MSEC);
+	atomic_init(&source->media_generation, 0);
+	atomic_init(&source->ready_video_generation, 0);
 	source_update(source, settings);
 	return source;
 }
@@ -736,9 +834,10 @@ static void source_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct rist_media_source *source = data;
+	promote_ready_video(source);
 	if (video_is_stale(source))
 		return;
-	obs_source_t *child = get_child(source);
+	obs_source_t *child = get_display_child(source);
 	if (child) {
 		obs_source_video_render(child);
 		obs_source_release(child);
@@ -747,7 +846,7 @@ static void source_render(void *data, gs_effect_t *effect)
 
 static uint32_t source_width(void *data)
 {
-	obs_source_t *child = get_child(data);
+	obs_source_t *child = get_display_child(data);
 	uint32_t width = child ? obs_source_get_width(child) : 0;
 	if (child)
 		obs_source_release(child);
@@ -756,7 +855,7 @@ static uint32_t source_width(void *data)
 
 static uint32_t source_height(void *data)
 {
-	obs_source_t *child = get_child(data);
+	obs_source_t *child = get_display_child(data);
 	uint32_t height = child ? obs_source_get_height(child) : 0;
 	if (child)
 		obs_source_release(child);
@@ -767,12 +866,63 @@ static uint32_t source_height(void *data)
 static enum gs_color_space source_color_space(void *data, size_t count,
 					       const enum gs_color_space *preferred_spaces)
 {
-	obs_source_t *child = get_child(data);
+	obs_source_t *child = get_display_child(data);
 	enum gs_color_space color_space =
 		child ? obs_source_get_color_space(child, count, preferred_spaces) : GS_CS_SRGB;
 	if (child)
 		obs_source_release(child);
 	return color_space;
+}
+
+static void source_enum_active_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
+{
+	struct rist_media_source *source = data;
+	obs_source_t *child = get_media_child(source);
+	if (child) {
+		enum_callback(source->source, child, param);
+		obs_source_release(child);
+	}
+}
+
+static bool source_audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output,
+				uint32_t mixers, size_t channels, size_t sample_rate)
+{
+	UNUSED_PARAMETER(sample_rate);
+	struct rist_media_source *source = data;
+	obs_source_t *child = get_media_child(source);
+	if (!child)
+		return false;
+
+	if (obs_source_audio_pending(child)) {
+		obs_source_release(child);
+		return false;
+	}
+
+	const uint64_t timestamp = obs_source_get_audio_timestamp(child);
+	if (!timestamp) {
+		obs_source_release(child);
+		return false;
+	}
+
+	struct obs_source_audio_mix child_audio;
+	obs_source_get_audio_mix(child, &child_audio);
+	/* Use OBS's processed child mix and timestamp. This is the same pull path
+	 * used by composite OBS sources and cannot leave raw audio tasks queued
+	 * across a decoder generation change. */
+	for (size_t mix = 0; mix < MAX_AUDIO_MIXES; ++mix) {
+		if ((mixers & (1U << mix)) == 0)
+			continue;
+		for (size_t channel = 0; channel < channels; ++channel) {
+			float *output = audio_output->output[mix].data[channel];
+			float *input = child_audio.output[mix].data[channel];
+			if (output && input)
+				memcpy(output, input, AUDIO_OUTPUT_FRAMES * sizeof(float));
+		}
+	}
+
+	*ts_out = timestamp;
+	obs_source_release(child);
+	return true;
 }
 
 static struct obs_source_info rist_media_source_info = {
@@ -787,6 +937,8 @@ static struct obs_source_info rist_media_source_info = {
 	.update = source_update,
 	.load = source_load,
 	.video_render = source_render,
+	.audio_render = source_audio_render,
+	.enum_active_sources = source_enum_active_sources,
 	.get_width = source_width,
 	.get_height = source_height,
 	.video_get_color_space = source_color_space,

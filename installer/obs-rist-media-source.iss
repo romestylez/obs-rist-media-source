@@ -1,8 +1,8 @@
 #define AppName "obs-rist-media-source"
-#define AppVersion "2.0.1"
+#define AppVersion "2.0.2"
 #define TargetObsVersion "32.2.1"
 #define CompatibleObsVersionPrefix "32.2."
-#define PackageDir "..\dist\obs-rist-media-source-2.0.1-obs-32.2.1-windows-x64"
+#define PackageDir "..\dist\obs-rist-media-source-2.0.2-obs-32.2.1-windows-x64"
 
 [Setup]
 AppId={{8F47116A-75D5-4BE6-A727-055887BD91C9}
